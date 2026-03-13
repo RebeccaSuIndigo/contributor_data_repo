@@ -110,86 +110,113 @@ use warehouse data_science;
 /****************** PRE ENGINE **************************/
 /********************************************************/
 
-use schema ci_dev.data_engineering;
-
-
-/* Get new records from CLEANSED.PROD.TRADE_CONTRIBUTORS */
-create or replace temp table stg_new_trade_db_contributors_tmp as
+/* Build contributor list with delta flag against previous delivery */
+create or replace temp table stg_new_trade_db_contributors_with_delta_tmp as
     with
-        -- Null out entries such as (Not availble), (Not Supplied), Unknown, Unknown Author, etc
-        pre_cleansed as (
-            select distinct
+        src as (
+            select
                 trade_db_contributor_id,
                 isbn13,
                 contributor_role,
                 contributor_order,
-                -- Null out entries such as (Not availble), (Not Supplied), Unknown, Unknown Author, etc
                 case
-                    when contributor_first_name ilike '%(not %)%' then null
-                    when contributor_first_name ilike 'unknown' then null
-                    when contributor_first_name ilike 'author' then null
-                    else contributor_first_name
-                end as contributor_first_name,
-                case
-                    when contributor_last_name ilike '%(not %)%' then null
-                    when contributor_last_name ilike 'unknown' then null
-                    when contributor_last_name ilike 'author' then null
-                    else contributor_last_name
-                end as contributor_last_name,
+                    when contributor_first_name is not null and contributor_last_name is not null
+                         and contributor_first_name <> contributor_last_name
+                    then contributor_first_name||' '||contributor_last_name
+                    when contributor_first_name is not null then contributor_first_name
+                    when contributor_last_name is not null then contributor_last_name
+                    else 'UNIDENTIFIED'
+                end as author_nm,
+                regexp_replace(
+                    trim(upper(regexp_replace(
+                        case
+                            when contributor_first_name is not null and contributor_last_name is not null
+                                 and contributor_first_name <> contributor_last_name
+                            then contributor_first_name||' '||contributor_last_name
+                            when contributor_first_name is not null then contributor_first_name
+                            when contributor_last_name is not null then contributor_last_name
+                            else 'UNIDENTIFIED'
+                        end,
+                        '[\\r\\n\\t]+',
+                        ' '
+                    ))),
+                    ' +',
+                    ' '
+                ) as author_nm_norm
             from cleansed.prod.trade_contributors
         ),
-        concatinated as (
-            select distinct
+        base as (
+            select
                 trade_db_contributor_id,
+                isbn13,
+                trade_db_contributor_role as contributor_role,
+                trade_db_contributor_order as contributor_order,
+                trade_db_author_name as author_nm,
+                regexp_replace(
+                    trim(upper(regexp_replace(trade_db_author_name, '[\\r\\n\\t]+', ' '))),
+                    ' +',
+                    ' '
+                ) as author_nm_norm
+            from ci_dev.data_engineering.matched_author_isbn13
+        ),
+        base_isbn as (
+            select distinct isbn13 from base
+        ),
+        base_role_order as (
+            select distinct isbn13, contributor_role, contributor_order from base
+        ),
+        base_exact as (
+            select distinct
                 isbn13,
                 contributor_role,
                 contributor_order,
-                -- Concatinate first and last names
-                case
-                    -- If both null
-                    when contributor_first_name is null and contributor_last_name is null then null
-                    -- Snowflake can be unpredictable with nulls, subing in empty strings as a guard
-                    when ifnull(contributor_first_name, '') = ifnull(contributor_last_name, '') then contributor_first_name
-                    -- If the first or last name is null (empty string) the added space will need to be trimmed
-                    else trim(concat(ifnull(contributor_first_name, ''), ' ', ifnull(contributor_last_name, '')))
-                end as author_nm
-            from pre_cleansed
-            where author_nm is not null
+                trade_db_contributor_id,
+                author_nm_norm
+            from base
         )
-        -- Get new records that are not in CLEANSED.PROD.MATCHED_AUTHOR_ISBN13
-        select distinct
-            trade_db_contributor_id,
-            isbn13,
-            author_nm,
-            contributor_role,
-            contributor_order
-        from concatinated con
-        where not exists (
-            select 1
-            from  ci_dev.data_engineering.matched_author_isbn13 mai
-            where mai.isbn13 = con.isbn13
-            and   mai.trade_db_contributor_id = con.trade_db_contributor_id
-            and   mai.trade_db_author_name = con.author_nm
-        );
+    select
+        s.trade_db_contributor_id,
+        s.isbn13,
+        s.contributor_role,
+        s.contributor_order,
+        s.author_nm,
+        case
+            when bi.isbn13 is null then 'NEW'
+            when bro.isbn13 is null then 'NEW'
+            when be.trade_db_contributor_id is null then 'CHANGED'
+            else 'SAME'
+        end as delta_flag
+    from src s
+    left join base_isbn bi
+        on s.isbn13 = bi.isbn13
+    left join base_role_order bro
+        on  s.isbn13 = bro.isbn13
+        and s.contributor_role = bro.contributor_role
+        and s.contributor_order = bro.contributor_order
+    left join base_exact be
+        on  s.isbn13 = be.isbn13
+        and s.contributor_role = be.contributor_role
+        and s.contributor_order = be.contributor_order
+        and s.trade_db_contributor_id = be.trade_db_contributor_id
+        and s.author_nm_norm = be.author_nm_norm;
+
+/* Get new and changed records from CLEANSED.PROD.TRADE_CONTRIBUTORS */
+create or replace temp table stg_new_trade_db_contributors_tmp as
+    select *
+    from stg_new_trade_db_contributors_with_delta_tmp
+    where delta_flag in ('NEW', 'CHANGED');
 
 /* Get distinct concatinated names to be fed into _PROD_AUTHOR_MATCHING_SP */
 create or replace temp table stg_new_trade_db_contributor_names_tmp as
-    select distinct author_nm from stg_new_trade_db_contributors_tmp;
-    
-/* Get INSIs and concatinated names to be fed into _PROD_AUTHOR_MATCHING_SP */
+    select distinct author_nm
+    from stg_new_trade_db_contributors_tmp
+    where upper(author_nm) not in ('UNIDENTIFIED', 'UNKNOWN');
+
+/* Get ISNIs and concatinated names to be fed into _PROD_AUTHOR_MATCHING_SP */
 create or replace temp table stg_isni_authors_tmp as
     select distinct
         isni,
-        first_name,
-        last_name,
-        case
-            -- If null
-            when first_name is null and last_name is null then null
-            -- Snowflake can be unpredictable with nulls, subing in empty strings as a guard
-            when ifnull(first_name, '') = ifnull(last_name, '') then first_name
-            -- If the first or last name is null (empty string) the added space will need to be trimmed
-            else trim(concat(ifnull(first_name, ''), ' ', ifnull(last_name, '')))
-        end as author
+        concat_ws(' ', first_name, last_name) as author
     from ci_dev.data_engineering.isni_authors;
 
 /********************************************************/
@@ -197,111 +224,119 @@ create or replace temp table stg_isni_authors_tmp as
 /********************************************************/
 
 /* import data into the staging table */
-/*snowflake.execute({ sqlText:   `call `+v_config_db+`.public._prod_author_matching_sp('`+v_config_db+`',                           --ETL_META DATABASE
-             ' ',                           --Stage Location
-             'stg_isni_authors_tmp',                      --ISNI Input table
-             'stg_new_trade_db_contributor_names_tmp',    --TRADE_CONTRIBUTORS Input table
-             'ci_dev.data_engineering.stg_matched_author_isbn13_engine_output',   --Engine output table
-             '42',                        --Transformation ID
-             'dead-beef-1701',                 --Pipeline Run ID
-             null)--Parameter used for testing
+/*snowflake.execute({ sqlText:   `call `+v_config_db+`.public._prod_author_matching_sp('`+v_config_db+`',
+             ' ',
+             'stg_isni_authors_tmp',
+             'stg_new_trade_db_contributor_names_tmp',
+             'ci_dev.data_engineering.stg_matched_author_isbn13_engine_output',
+             '42',
+             'dead-beef-1701',
+             null)
              ;*/
 
 /********************************************************/
 /****************** POST ENGINE *************************/
 /********************************************************/
 
-
 /* Get authors flagged as unique from matching engine output */
 create or replace temp table stg_contributor_engine_output_unique_tmp as
-    select * from ci_dev.data_engineering.stg_matched_author_isbn13_engine_output
+    select *
+    from ci_dev.data_engineering.stg_matched_author_isbn13_engine_output
     where dup_name_flag is null;
 
 /* Get authors flagged as having duplicates from matching engine output */
 create or replace temp table stg_contributor_engine_output_dupes_tmp as
-    select * from ci_dev.data_engineering.stg_matched_author_isbn13_engine_output
+    select *
+    from ci_dev.data_engineering.stg_matched_author_isbn13_engine_output
     where dup_name_flag = 'Y';
 
-/* Get and Flag records that will refrence ISNI for Indigo Contributor ID */
+/* Get and flag records that will reference ISNI for Indigo Contributor ID */
 create or replace temp table stg_isbn_contributor_isni_sourced_tmp as
-    select 
-        eout.*, 
-        eunq.matched_isni, 
-        case 
-            when eunq.matched_isni is not null then 'ISNI' 
-            else null 
+    select
+        eout.*,
+        eunq.matched_isni,
+        case
+            when eunq.matched_isni is not null then 'ISNI'
+            else null
         end as ref_to
     from stg_new_trade_db_contributors_tmp eout
-    left join stg_contributor_engine_output_unique_tmp eunq on eout.author_nm = eunq.author_nm;
+    left join stg_contributor_engine_output_unique_tmp eunq
+        on eout.author_nm = eunq.author_nm;
 
-/* Get reocrds that will not refrence ISNI for Indigo Contributor ID */
+/* Get records that will not reference ISNI for Indigo Contributor ID */
 create or replace temp table stg_isbn_contributor_not_isni_sourced_tmp as
-    select * from stg_new_trade_db_contributors_tmp
-    where ISBN13||'_'||AUTHOR_NM not in 
-        (select ISBN13||'_'||AUTHOR_NM 
-        from stg_isbn_contributor_isni_sourced_tmp 
-        where ref_to is not null);
+    select *
+    from stg_new_trade_db_contributors_tmp
+    where trade_db_contributor_id||'_'||isbn13||'_'||contributor_role||'_'||contributor_order||'_'||author_nm
+        not in (
+            select trade_db_contributor_id||'_'||isbn13||'_'||contributor_role||'_'||contributor_order||'_'||author_nm
+            from stg_isbn_contributor_isni_sourced_tmp
+            where ref_to is not null
+        );
 
 /* Get the authors from CLEANSED.PROD.ISNI_AUTHORS */
-create or replace temp table stg_isni_full_authors_tmp as 
-    select distinct 
+create or replace temp table stg_isni_full_authors_tmp as
+    select distinct
         isni,
-        case 
-            when first_name is not null and 
-                 last_name is not null and 
-                 first_name <> last_name 
+        case
+            when first_name is not null and
+                 last_name is not null and
+                 first_name <> last_name
             then first_name||' '||last_name
-            when first_name is not null 
+            when first_name is not null
             then first_name
-            when last_name is not null 
+            when last_name is not null
             then last_name
-            else 'UNIDENTIFIED' 
+            else 'UNIDENTIFIED'
         end as full_name
     from ci_dev.data_engineering.isni_authors;
 
-/* Add in ISBNS */
+/* Add in ISBNs */
 create or replace temp table stg_isni_full_isbn_authors_tmp as
-    select 
-        iis.isbn13, 
-        iis.isni, 
+    select
+        iis.isbn13,
+        iis.isni,
         ifa.full_name
-    -- Distinct out potential dupes
-    from (select distinct 
-            isbn13, 
-            isni 
+    from (
+        select distinct
+            isbn13,
+            isni
         from ci_dev.data_engineering.isni_isbns
-        ) iis
-    inner join stg_isni_full_authors_tmp ifa on iis.isni = ifa.isni;
+    ) iis
+    inner join stg_isni_full_authors_tmp ifa
+        on iis.isni = ifa.isni;
 
 /* Map ISBNs and contributors */
 create or replace temp table stg_final_isbn_contributor_tmp as
     select
         nis.*,
-        -- iia.isni is from isni web and eod.matched_isni is from matching engine, and we take the isni from website as higher priority
-        coalesce(iia.isni, eod.matched_isni) as final_isni,  
-        case 
+        iia.isni,
+        eod.matched_isni as engine_matched_isni,
+        coalesce(iia.isni, eod.matched_isni) as final_isni,
+        case
             when iia.isni is not null and iia.isni = eod.matched_isni then 'Unique Match'
             when iia.isni is not null and iia.isni <> eod.matched_isni then 'Conflict'
             when iia.isni is null then 'No Match Found'
             else 'Undetermined'
         end as match_status
     from stg_isbn_contributor_not_isni_sourced_tmp nis
-    -- this table is the table from isni web after manipulation (including isni, full name and isbn13)
-    left join stg_isni_full_isbn_authors_tmp iia  
-        on  nis.isbn13 = iia.isbn13 
+    left join stg_isni_full_isbn_authors_tmp iia
+        on  nis.isbn13 = iia.isbn13
         and nis.author_nm = iia.full_name
     left join stg_contributor_engine_output_dupes_tmp eod
-        on  nis.author_nm = eod.author_nm 
+        on  nis.author_nm = eod.author_nm
         and iia.isni = eod.matched_isni;
 
 /* Get flags for when sourced from Pre-filled ISNI records */
 create or replace temp table stg_isbn_contributor_isni_prefilled_isni_tmp as
-    select 
-        trade_db_contributor_id, 
-        isbn13, contributor_role, 
-        contributor_order, 
-        author_nm, 
-        final_isni, 
+    select
+        trade_db_contributor_id,
+        isbn13,
+        contributor_role,
+        contributor_order,
+        author_nm,
+        delta_flag,
+        final_isni,
         'ISNI&PREFILLISNI' as ref_to
     from stg_final_isbn_contributor_tmp
     where match_status = 'Unique Match';
@@ -310,114 +345,77 @@ create or replace temp table stg_isbn_contributor_isni_prefilled_isni_tmp as
 create or replace temp table stg_isbn_contributor_isni_prefilled_isni_final_tmp as
     select *
     from stg_isbn_contributor_isni_prefilled_isni_tmp
-    where (isbn13, contributor_role, contributor_order, author_nm) 
-        in (
-            select 
-                isbn13, 
-                contributor_role, 
-                contributor_order, 
-                author_nm
-            from stg_isbn_contributor_isni_prefilled_isni_tmp
-            group by isbn13, contributor_role, contributor_order, author_nm
-            having count(*) = 1);
+    where (isbn13, contributor_role, contributor_order, author_nm) in (
+        select
+            isbn13,
+            contributor_role,
+            contributor_order,
+            author_nm
+        from stg_isbn_contributor_isni_prefilled_isni_tmp
+        group by isbn13, contributor_role, contributor_order, author_nm
+        having count(*) = 1
+    );
 
 /* Get records not sourced from ISNI or Prefilled ISNI */
-create or replace temp table stg_isbn_contributor_not_isni_or_prefilled_isni_sourced_tmp as 
-    select * from stg_new_trade_db_contributors_tmp
-    where isbn13||'_'||author_nm not in (select isbn13||'_'||author_nm from stg_isbn_contributor_isni_sourced_tmp where ref_to is not null)
-    and   isbn13||'_'||author_nm not in (select isbn13||'_'||author_nm from stg_isbn_contributor_isni_prefilled_isni_final_tmp where ref_to is not null);
+create or replace temp table stg_isbn_contributor_not_isni_or_prefilled_isni_sourced_tmp as
+    select *
+    from stg_new_trade_db_contributors_tmp
+    where trade_db_contributor_id||'_'||isbn13||'_'||contributor_role||'_'||contributor_order||'_'||author_nm
+        not in (
+            select trade_db_contributor_id||'_'||isbn13||'_'||contributor_role||'_'||contributor_order||'_'||author_nm
+            from stg_isbn_contributor_isni_sourced_tmp
+            where ref_to is not null
+        )
+      and trade_db_contributor_id||'_'||isbn13||'_'||contributor_role||'_'||contributor_order||'_'||author_nm
+        not in (
+            select trade_db_contributor_id||'_'||isbn13||'_'||contributor_role||'_'||contributor_order||'_'||author_nm
+            from stg_isbn_contributor_isni_prefilled_isni_final_tmp
+            where ref_to is not null
+        );
 
 /* Combine ISNI and Prefilled ISNI sourced */
-create or replace temp table stg_isbn_contributor_isni_and_prefilled_isni_sourced_tmp as 
-    select 
-        trade_db_contributor_id, 
-        isbn13, 
-        contributor_role, 
-        contributor_order, 
-        author_nm, 
-        matched_isni, 
-        ref_to 
-    from stg_isbn_contributor_isni_sourced_tmp where ref_to is not null
-    union
-    select 
-        trade_db_contributor_id, 
-        isbn13, 
-        contributor_role, 
-        contributor_order, 
-        author_nm, 
-        final_isni as matched_isni, 
-        ref_to
-    from stg_isbn_contributor_isni_prefilled_isni_final_tmp where ref_to is not null;
-
-/* Combine ISNI and Prefilled ISNI sourced with CLEANSED.PROD.MATCHED_AUTHOR_ISBN13 */
-create or replace temp table stg_isbn_contributor_isni_and_prefilled_isni_sourced_base_combined_tmp as
-    select 
-        trade_db_contributor_id, 
-        isbn13, 
-        contributor_role, 
-        contributor_order, 
-        author_nm, 
-        matched_isni, 
-        ref_to
-    from stg_isbn_contributor_isni_and_prefilled_isni_sourced_tmp
-    union 
-    select 
-        trade_db_contributor_id, 
-        isbn13, 
-        trade_db_contributor_role as contributor_role, 
-        trade_db_contributor_order as contributor_order, 
-        trade_db_author_name as author_nm, 
-        matched_isni, 
-        id_source as ref_to 
-        from  ci_dev.data_engineering.matched_author_isbn13
-    where ref_to in ('ISNI', 'ISNI&PREFILLISNI');
-
-/* Get unique TRADE_DB_CONTRIBUTOR_ID and ISNI pairs */
-create or replace temp table stg_has_unique_isni_tmp as
-    select 
-        trade_db_contributor_id, 
-        max(matched_isni) as matched_isni
-    from stg_isbn_contributor_isni_and_prefilled_isni_sourced_base_combined_tmp
-    group by trade_db_contributor_id
-    having count(distinct matched_isni) = 1;
-
-/* Get records that sourced from TRADE_CONTRIBUTORS and ISNI */
-create or replace temp table stg_trade_contributors_and_isni_sourced_tmp as
-    select 
-        ini.*,
-        unq.matched_isni,
-        case 
-            when unq.matched_isni is not null then 'TRADEDBID&ISNI' 
-            else null 
-        end as ref_to
-    from stg_isbn_contributor_not_isni_or_prefilled_isni_sourced_tmp ini
-    left join stg_has_unique_isni_tmp unq on ini.trade_db_contributor_id = unq.trade_db_contributor_id;
-
-/* Get records from new TRADE_CONTRIBUTORS that haven't been flagged yet */
-create or replace temp table stg_new_contributors_not_flagged_tmp as 
-    select * from stg_new_trade_db_contributors_tmp
-        where isbn13||'_'||author_nm not in (select isbn13||'_'||author_nm 
-    from stg_isbn_contributor_isni_sourced_tmp 
-    where ref_to is not null)
-        and   isbn13||'_'||author_nm not in (select isbn13||'_'||author_nm 
-    from stg_isbn_contributor_isni_prefilled_isni_final_tmp 
-    where ref_to is not null)
-        and  isbn13||'_'||author_nm not in (select isbn13||'_'||author_nm 
-    from stg_trade_contributors_and_isni_sourced_tmp 
-    where ref_to is not null);
-
-/* Combine ISNI, Prefilled ISNI and TRADE_CONTRIBUTORS sourced */
-create or replace temp table stg_trade_contributors_prefilled_isni_and_isni_sourced_tmp as 
-    select  
+create or replace temp table stg_isbn_contributor_isni_and_prefilled_isni_sourced_tmp as
+    select
         trade_db_contributor_id,
         isbn13,
         contributor_role,
         contributor_order,
         author_nm,
+        delta_flag,
         matched_isni,
         ref_to
-    from stg_isbn_contributor_isni_and_prefilled_isni_sourced_tmp
+    from stg_isbn_contributor_isni_sourced_tmp
+    where ref_to is not null
     union
+    select
+        trade_db_contributor_id,
+        isbn13,
+        contributor_role,
+        contributor_order,
+        author_nm,
+        delta_flag,
+        final_isni as matched_isni,
+        ref_to
+    from stg_isbn_contributor_isni_prefilled_isni_final_tmp
+    where ref_to is not null;
+
+/* Apply combined_1 CHANGED rows before deriving unique ISNIs */
+update ci_dev.data_engineering.matched_author_isbn13 tgt
+    set
+        tgt.trade_db_contributor_id = src.trade_db_contributor_id,
+        tgt.trade_db_author_name    = src.author_nm,
+        tgt.matched_isni            = src.matched_isni,
+        tgt.id_source               = src.ref_to,
+        tgt.indigo_author_id        = null,
+        tgt.normailized_author_name = null
+    from stg_isbn_contributor_isni_and_prefilled_isni_sourced_tmp src
+    where src.delta_flag = 'CHANGED'
+      and tgt.isbn13 = src.isbn13
+      and tgt.trade_db_contributor_role = src.contributor_role
+      and tgt.trade_db_contributor_order = src.contributor_order;
+
+/* Combine NEW ISNI and Prefilled ISNI sourced with base table ISNI-sourced records */
+create or replace temp table stg_isbn_contributor_isni_and_prefilled_isni_sourced_base_combined_tmp as
     select
         trade_db_contributor_id,
         isbn13,
@@ -426,55 +424,301 @@ create or replace temp table stg_trade_contributors_prefilled_isni_and_isni_sour
         author_nm,
         matched_isni,
         ref_to
-    from stg_trade_contributors_and_isni_sourced_tmp where ref_to is not null;
-
-/* Get flags for records that sourced from TRADE_CONTRIBUTORS */
-create or replace temp table stg_trade_contributor_sourced_tmp as
-    select 
+    from stg_isbn_contributor_isni_and_prefilled_isni_sourced_tmp
+    where delta_flag = 'NEW'
+    union
+    select
         trade_db_contributor_id,
         isbn13,
-        author_nm,
+        trade_db_contributor_role as contributor_role,
+        trade_db_contributor_order as contributor_order,
+        trade_db_author_name as author_nm,
+        matched_isni,
+        id_source as ref_to
+    from ci_dev.data_engineering.matched_author_isbn13
+    where id_source in ('ISNI', 'ISNI&PREFILLISNI', 'TRADEDBID&ISNI');
+
+/* Get unique TRADE_DB_CONTRIBUTOR_ID and ISNI pairs */
+create or replace temp table stg_has_unique_isni_tmp as
+    select
+        trade_db_contributor_id,
+        max(matched_isni) as matched_isni
+    from stg_isbn_contributor_isni_and_prefilled_isni_sourced_base_combined_tmp
+    group by trade_db_contributor_id
+    having count(distinct matched_isni) = 1;
+
+/* Get records that sourced from TRADE_CONTRIBUTORS and ISNI */
+create or replace temp table stg_trade_contributors_and_isni_sourced_tmp as
+    select
+        ini.*,
+        unq.matched_isni,
+        case
+            when unq.matched_isni is not null then 'TRADEDBID&ISNI'
+            else null
+        end as ref_to
+    from stg_isbn_contributor_not_isni_or_prefilled_isni_sourced_tmp ini
+    left join stg_has_unique_isni_tmp unq
+        on ini.trade_db_contributor_id = unq.trade_db_contributor_id;
+
+/* Get records from new TRADE_CONTRIBUTORS that haven't been flagged yet */
+create or replace temp table stg_new_contributors_not_flagged_tmp as
+    select *
+    from stg_new_trade_db_contributors_tmp
+    where trade_db_contributor_id||'_'||isbn13||'_'||contributor_role||'_'||contributor_order||'_'||author_nm
+        not in (
+            select trade_db_contributor_id||'_'||isbn13||'_'||contributor_role||'_'||contributor_order||'_'||author_nm
+            from stg_isbn_contributor_isni_sourced_tmp
+            where ref_to is not null
+        )
+      and trade_db_contributor_id||'_'||isbn13||'_'||contributor_role||'_'||contributor_order||'_'||author_nm
+        not in (
+            select trade_db_contributor_id||'_'||isbn13||'_'||contributor_role||'_'||contributor_order||'_'||author_nm
+            from stg_isbn_contributor_isni_prefilled_isni_final_tmp
+            where ref_to is not null
+        )
+      and trade_db_contributor_id||'_'||isbn13||'_'||contributor_role||'_'||contributor_order||'_'||author_nm
+        not in (
+            select trade_db_contributor_id||'_'||isbn13||'_'||contributor_role||'_'||contributor_order||'_'||author_nm
+            from stg_trade_contributors_and_isni_sourced_tmp
+            where ref_to is not null
+        );
+
+/* Combine ISNI, Prefilled ISNI and TRADE_CONTRIBUTORS sourced */
+create or replace temp table stg_trade_contributors_prefilled_isni_and_isni_sourced_tmp as
+    select *
+    from stg_isbn_contributor_isni_and_prefilled_isni_sourced_tmp
+    union
+    select *
+    from stg_trade_contributors_and_isni_sourced_tmp
+    where ref_to is not null;
+
+/* Get flags for records that sourced from TRADE_CONTRIBUTORS only */
+create or replace temp table stg_trade_contributor_sourced_tmp as
+    select
+        trade_db_contributor_id,
+        isbn13,
         contributor_role,
-        contributor_order, 
-        'trdb'||''||trade_db_contributor_id as matched_isni, 
+        contributor_order,
+        author_nm,
+        delta_flag,
+        'trdb'||''||trade_db_contributor_id as matched_isni,
         'TRADEDBID' as ref_to
     from stg_new_contributors_not_flagged_tmp;
 
 /* Combine all records with a source flag */
-create or replace temp table stg_combined_sources_with_flag_tmp as 
-    select 
-        trade_db_contributor_id,
-        isbn13,
-        contributor_role,
-        contributor_order,
-        author_nm,
-        matched_isni,
-        ref_to
+create or replace temp table stg_combined_sources_with_flag_tmp as
+    select *
     from stg_trade_contributors_prefilled_isni_and_isni_sourced_tmp
     union
-    select 
-        trade_db_contributor_id,
-        isbn13,
-        contributor_role,
-        contributor_order,
-        author_nm,
-        matched_isni,
-        ref_to
-    from stg_trade_contributor_sourced_tmp 
+    select *
+    from stg_trade_contributor_sourced_tmp
     where ref_to is not null;
 
 /********************************************************/
 /****************** TIDY UP *****************************/
-/********************************************************/ 
-       
-/* truncate the staging table that you should have already created in Snowflake */
-truncate table ci_dev.data_engineering.stg_matched_author_isbn13;
+/********************************************************/
+
+/* Apply the final CHANGED set before Indigo backfill */
+update ci_dev.data_engineering.matched_author_isbn13 tgt
+    set
+        tgt.trade_db_contributor_id = src.trade_db_contributor_id,
+        tgt.trade_db_author_name    = src.author_nm,
+        tgt.matched_isni            = src.matched_isni,
+        tgt.id_source               = src.ref_to,
+        tgt.indigo_author_id        = null,
+        tgt.normailized_author_name = null
+    from stg_combined_sources_with_flag_tmp src
+    where src.delta_flag = 'CHANGED'
+      and tgt.isbn13 = src.isbn13
+      and tgt.trade_db_contributor_role = src.contributor_role
+      and tgt.trade_db_contributor_order = src.contributor_order;
+
+/* Backfill INDIGO_AUTHOR_ID and NORMAILIZED_AUTHOR_NAME from matching ISNI */
+update ci_dev.data_engineering.matched_author_isbn13 tgt
+    set
+        tgt.indigo_author_id        = src.indigo_author_id,
+        tgt.normailized_author_name = src.normailized_author_name
+    from (
+        select
+            matched_isni,
+            max(indigo_author_id)        as indigo_author_id,
+            max(normailized_author_name) as normailized_author_name
+        from ci_dev.data_engineering.matched_author_isbn13
+        where matched_isni is not null
+          and indigo_author_id is not null
+        group by matched_isni
+    ) src
+    where tgt.indigo_author_id is null
+      and tgt.matched_isni = src.matched_isni;
 
 /********************************************************/
 /****************** STAGE DATA **************************/
 /********************************************************/
 
-/* insert data into the staging table */
+/* Create new records staging table (NEW delta_flag only) with placeholder for INDIGO_CONTR_ID */
+create or replace temp table stg_matched_author_isbn13_new_tmp as
+    select
+        *,
+        null::bigint as indigo_contr_id
+    from stg_combined_sources_with_flag_tmp
+    where delta_flag = 'NEW';
+
+/* Backfill INDIGO_CONTR_ID from the base table by matching on ISNI */
+update stg_matched_author_isbn13_new_tmp n
+    set indigo_contr_id = b.indigo_author_id
+    from (
+        select
+            matched_isni,
+            indigo_author_id
+        from ci_dev.data_engineering.matched_author_isbn13
+        where indigo_author_id is not null
+        qualify row_number() over (partition by matched_isni order by matched_isni) = 1
+    ) b
+    where n.matched_isni = b.matched_isni;
+
+/********************************************************/
+/****************** TRANSFORMATIONS *********************/
+/********************************************************/
+
+/* Build combined table: base + newly staged records */
+create or replace temp table stg_indigo_contributor_book_ref_combined_tmp as
+    select
+        trade_db_contributor_id,
+        isbn13,
+        trade_db_contributor_role as contributor_role,
+        trade_db_contributor_order as contributor_order,
+        trade_db_author_name as author_nm,
+        matched_isni,
+        id_source as ref_to,
+        indigo_author_id as indigo_contr_id
+    from ci_dev.data_engineering.matched_author_isbn13
+    union all
+    select
+        trade_db_contributor_id,
+        isbn13,
+        contributor_role,
+        contributor_order,
+        author_nm,
+        matched_isni,
+        ref_to,
+        indigo_contr_id
+    from stg_matched_author_isbn13_new_tmp;
+
+/* Create INDIGO_CONTR_ID for ISNIs that still do not have one */
+update stg_indigo_contributor_book_ref_combined_tmp tgt
+    set tgt.indigo_contr_id = m.final_indigo_contr_id
+    from (
+        with
+        used_max as (
+            select coalesce(max(indigo_contr_id), 0) as max_used_id
+            from stg_indigo_contributor_book_ref_combined_tmp
+            where indigo_contr_id is not null
+        ),
+        existing_isni_map as (
+            select
+                matched_isni,
+                max(indigo_contr_id) as indigo_contr_id
+            from stg_indigo_contributor_book_ref_combined_tmp
+            where matched_isni is not null
+              and indigo_contr_id is not null
+            group by matched_isni
+        ),
+        missing_isni as (
+            select distinct
+                t.matched_isni
+            from stg_indigo_contributor_book_ref_combined_tmp t
+            left join existing_isni_map e
+                on t.matched_isni = e.matched_isni
+            where t.indigo_contr_id is null
+              and t.matched_isni is not null
+              and e.matched_isni is null
+        ),
+        allocated_new_ids as (
+            select
+                mi.matched_isni,
+                (select max_used_id from used_max)
+                + row_number() over (order by mi.matched_isni) as new_indigo_contr_id
+            from missing_isni mi
+        ),
+        final_isni_map as (
+            select
+                t.matched_isni,
+                coalesce(e.indigo_contr_id, a.new_indigo_contr_id) as final_indigo_contr_id
+            from (
+                select distinct matched_isni
+                from stg_indigo_contributor_book_ref_combined_tmp
+                where indigo_contr_id is null
+                  and matched_isni is not null
+            ) t
+            left join existing_isni_map e
+                on t.matched_isni = e.matched_isni
+            left join allocated_new_ids a
+                on t.matched_isni = a.matched_isni
+        )
+        select *
+        from final_isni_map
+    ) m
+    where tgt.indigo_contr_id is null
+      and tgt.matched_isni = m.matched_isni;
+
+/* Null out ISNI, source flag and Indigo ID for unidentified/unknown/anonymous records */
+update stg_indigo_contributor_book_ref_combined_tmp
+    set
+        matched_isni = null,
+        ref_to = null,
+        indigo_contr_id = null
+    where upper(author_nm) in ('UNIDENTIFIED', 'UNKNOWN', 'ANONYMOUS');
+
+/* Populate INDIGO_CONTR_NM */
+create or replace temp table stg_indigo_contributor_book_ref_final_tmp as
+    select
+        t.trade_db_contributor_id,
+        t.isbn13,
+        t.contributor_role,
+        t.contributor_order,
+        t.author_nm,
+        t.matched_isni,
+        t.ref_to,
+        t.indigo_contr_id,
+        c.indigo_contr_nm
+    from stg_indigo_contributor_book_ref_combined_tmp t
+    left join (
+        select
+            indigo_contr_id,
+            author_nm as indigo_contr_nm
+        from (
+            select
+                indigo_contr_id,
+                author_nm,
+                count(*) as cnt,
+                row_number() over (
+                    partition by indigo_contr_id
+                    order by
+                        cnt desc,
+                        length(author_nm) desc,
+                        author_nm asc
+                ) as rn
+            from stg_indigo_contributor_book_ref_combined_tmp
+            where indigo_contr_id is not null
+              and author_nm is not null
+            group by indigo_contr_id, author_nm
+        )
+        where rn = 1
+    ) c
+        on t.indigo_contr_id = c.indigo_contr_id;
+
+/********************************************************/
+/****************** DATA LOAD ***************************/
+/********************************************************/
+
+/* Keep the delivery snapshot output used by analytics validation */
+create or replace table ci_dev.data_science.indigo_contributor_book_ref_20260226 as
+    select *
+    from stg_indigo_contributor_book_ref_final_tmp;
+
+/* Sync into ETL staging table using Erin-style load structure */
+truncate table ci_dev.data_engineering.stg_matched_author_isbn13;
+
 insert into ci_dev.data_engineering.stg_matched_author_isbn13 (
     isbn13,
     indigo_author_id,
@@ -485,133 +729,39 @@ insert into ci_dev.data_engineering.stg_matched_author_isbn13 (
     normailized_author_name,
     trade_db_author_name,
     id_source,
-    transformation_id,
-    pipeline_run_id,
-    source_filename
+    dmc_sync_hash_id,
+    dmc_synced,
+    transformation_id
 )
 select distinct
     isbn13,
-    null as indigo_author_id,
+    indigo_contr_id as indigo_author_id,
     trade_db_contributor_id,
     contributor_role as trade_db_contributor_role,
     contributor_order as trade_db_contributor_order,
     matched_isni,
-    null as normailized_author_name,
+    indigo_contr_nm as normailized_author_name,
     author_nm as trade_db_author_name,
     ref_to as id_source,
-    42,
-    'dead-beef-1701',
-    ''
-from stg_combined_sources_with_flag_tmp;
+    hash(trade_db_contributor_id, indigo_contr_id, indigo_contr_nm, matched_isni) as dmc_sync_hash_id,
+    true as dmc_synced,
+    42 as transformation_id
+from stg_indigo_contributor_book_ref_final_tmp;
 
-/********************************************************/
-/****************** TRANSFORMATIONS *********************/
-/********************************************************/
-
-/* Backfill INDIGO_AUTHOR_ID from CLEANSED.PROD.MATCHED_AUTHOR_ISBN13 */
-update ci_dev.data_engineering.stg_matched_author_isbn13 stg
-    set indigo_author_id = cln.indigo_author_id
-    from (
-        select
-            -- The original logic had trdb concatinated with the TRADE_DB_CONTRIBUTOR_ID as a placeholder
-            -- when there was no matched ISNI for this to work.
-            -- In production this is nulled out of for the cleanesed table, so we recreate it here
-            ifnull(matched_isni, concat('trdb', trade_db_contributor_id)) as matched_isni, 
-            indigo_author_id
-        from ci_dev.data_engineering.matched_author_isbn13
-        qualify row_number() over (partition by ifnull(matched_isni, concat('trdb', trade_db_contributor_id)) order by matched_isni) = 1
-    ) cln
-    where stg.matched_isni = cln.matched_isni;
-
-/* Create new INDIGO_AUTHOR_ID where authors didn't have one before */
-update ci_dev.data_engineering.stg_matched_author_isbn13 stg
-    set indigo_author_id = new.new_indigo_author_id
-    from (
-        with max_id as (
-            select max(indigo_author_id) as max_indigo_author_id
-            from (
-                select indigo_author_id from  ci_dev.data_engineering.matched_author_isbn13
-                union all
-                select indigo_author_id from ci_dev.data_engineering.stg_matched_author_isbn13
-            )
-        ),
-        new_isni as (
-            select distinct matched_isni
-            from ci_dev.data_engineering.stg_matched_author_isbn13
-            where indigo_author_id is null
-        )
-        select
-            nis.matched_isni,
-            mid.max_indigo_author_id
-            + row_number() over (order by nis.matched_isni) as new_indigo_author_id
-        from new_isni nis
-        cross join max_id mid
-    ) new
-    where stg.matched_isni = new.matched_isni
-    and stg.indigo_author_id is null;
-
-/* Populate Consolidated Author Names */
-update ci_dev.data_engineering.stg_matched_author_isbn13 as stg
-    set normailized_author_name = ctl.trade_db_author_name
-    from (
-    select indigo_author_id, trade_db_author_name
-    from (
-        select
-        indigo_author_id,
-        trade_db_author_name,
-        count(*) as frequency,
-        row_number() over (
-            partition by indigo_author_id
-            order by
-            frequency desc,                    -- most frequent first
-            length(trade_db_author_name) desc,  -- tie-breaker 1: longer name wins
-            trade_db_author_name asc            -- tie-breaker 2: alphabetical
-        ) as rn
-        from ci_dev.data_engineering.stg_matched_author_isbn13
-        where indigo_author_id is not null
-        and trade_db_author_name  is not null
-        group by indigo_author_id, trade_db_author_name
-    )
-    where rn = 1
-    ) as ctl
-    where stg.indigo_author_id = ctl.indigo_author_id;
-
-/* Generate DMC_SYNC_HASH_IDs */
-update ci_dev.data_engineering.stg_matched_author_isbn13
-    set dmc_sync_hash_id = hash(
-        trade_db_contributor_id,
-        indigo_author_id,
-        normailized_author_name,
-        matched_isni
-    );
-
-/* Clear out ISNI palceholders now that all hashes have been calculated */
-update ci_dev.data_engineering.stg_matched_author_isbn13
-    set matched_isni = null
-    where matched_isni ilike 'trdb%';
-
-/* There may be cases where the INDIGO_AUTHOR_ID or the NORMALIZED_AUTHOR_NAME is null. */
-delete from ci_dev.data_engineering.stg_matched_author_isbn13 
-where indigo_author_id is null 
-or    normailized_author_name is null;
-
-/********************************************************/
-/****************** DATA LOAD ***************************/
-/********************************************************/
-
-/* Get the existing DMC_SYNC_HASH_IDs from CLEANSED to identify changed records after the merge */
+/* Capture old hashes to identify inserted/changed rows */
 create or replace temp table ci_dev.data_engineering.stg_matched_author_isbn13_old_hashes_tmp as
-    select dmc_sync_hash_id from  ci_dev.data_engineering.matched_author_isbn13
-;
+    select dmc_sync_hash_id
+    from ci_dev.data_engineering.matched_author_isbn13;
 
-merge into ci_dev.data_engineering.matched_author_isbn13 t using ci_dev.data_engineering.stg_matched_author_isbn13 s on
-t.isbn13 = s.isbn13 and
-t.indigo_author_id = s.indigo_author_id and
-t.trade_db_contributor_id = s.trade_db_contributor_id and
-t.trade_db_contributor_order = s.trade_db_contributor_order and
-t.trade_db_contributor_role = s.trade_db_contributor_role
+merge into ci_dev.data_engineering.matched_author_isbn13 t
+using ci_dev.data_engineering.stg_matched_author_isbn13 s
+on t.isbn13 = s.isbn13
+   and t.indigo_author_id = s.indigo_author_id
+   and t.trade_db_contributor_id = s.trade_db_contributor_id
+   and t.trade_db_contributor_order = s.trade_db_contributor_order
+   and t.trade_db_contributor_role = s.trade_db_contributor_role
 when not matched then insert
-(    
+(
     isbn13,
     indigo_author_id,
     trade_db_contributor_id,
@@ -625,7 +775,7 @@ when not matched then insert
     transformation_id
 )
 values
-(    
+(
     s.isbn13,
     s.indigo_author_id,
     s.trade_db_contributor_id,
@@ -653,11 +803,11 @@ set
     t.etl_updated_date = current_timestamp,
     t.transformation_id = 42;
 
-/* Set the DMC_SYNCED = FALSE where there are new or changed records */
+/* Mark only new/changed rows as not synced */
 update ci_dev.data_engineering.matched_author_isbn13 dst
-set dmc_synced = false 
+set dmc_synced = false
 where not exists (
     select 1
     from ci_dev.data_engineering.stg_matched_author_isbn13_old_hashes_tmp old
     where dst.dmc_sync_hash_id = old.dmc_sync_hash_id
-    );
+);
