@@ -579,8 +579,12 @@ update stg_matched_author_isbn13_new_tmp n
 /********************************************************/
 /****************** TRANSFORMATIONS *********************/
 /********************************************************/
-
-/* Build combined table: base + newly staged records */
+/* Build combined table: full base (previous delivery) + newly staged NEW records.
+   [NEW] Replaces Original Logic's direct operation on stg_matched_author_isbn13;
+   by unifying base + new here, the three Original Logic-style UPDATE steps below operate on
+   the full combined set rather than just the staging table, ensuring IDs and names
+   are consistent across old and new records. UNION ALL is intentional as the same ISNI
+   can appear under different contributor IDs in each set. */
 create or replace temp table stg_indigo_contributor_book_ref_combined_tmp as
     select
         trade_db_contributor_id,
@@ -604,72 +608,65 @@ create or replace temp table stg_indigo_contributor_book_ref_combined_tmp as
         indigo_contr_id
     from stg_matched_author_isbn13_new_tmp;
 
-/* Create INDIGO_CONTR_ID for ISNIs that still do not have one */
-update stg_indigo_contributor_book_ref_combined_tmp tgt
-    set tgt.indigo_contr_id = m.final_indigo_contr_id
+/* Backfill INDIGO_CONTR_ID from matched_author_isbn13 where a matching ISNI already exists.
+   Adapted from Original Logic step 1 (Backfill INDIGO_AUTHOR_ID from CLEANSED.PROD.MATCHED_AUTHOR_ISBN13);
+   targets stg_indigo_contributor_book_ref_combined_tmp instead of stg_matched_author_isbn13. */
+update stg_indigo_contributor_book_ref_combined_tmp stg
+    set indigo_contr_id = cln.indigo_author_id
     from (
-        with
-        used_max as (
-            select coalesce(max(indigo_contr_id), 0) as max_used_id
-            from stg_indigo_contributor_book_ref_combined_tmp
-            where indigo_contr_id is not null
-        ),
-        existing_isni_map as (
-            select
-                matched_isni,
-                max(indigo_contr_id) as indigo_contr_id
-            from stg_indigo_contributor_book_ref_combined_tmp
-            where matched_isni is not null
-              and indigo_contr_id is not null
-            group by matched_isni
-        ),
-        missing_isni as (
-            select distinct
-                t.matched_isni
-            from stg_indigo_contributor_book_ref_combined_tmp t
-            left join existing_isni_map e
-                on t.matched_isni = e.matched_isni
-            where t.indigo_contr_id is null
-              and t.matched_isni is not null
-              and e.matched_isni is null
-        ),
-        allocated_new_ids as (
-            select
-                mi.matched_isni,
-                (select max_used_id from used_max)
-                + row_number() over (order by mi.matched_isni) as new_indigo_contr_id
-            from missing_isni mi
-        ),
-        final_isni_map as (
-            select
-                t.matched_isni,
-                coalesce(e.indigo_contr_id, a.new_indigo_contr_id) as final_indigo_contr_id
-            from (
-                select distinct matched_isni
-                from stg_indigo_contributor_book_ref_combined_tmp
-                where indigo_contr_id is null
-                  and matched_isni is not null
-            ) t
-            left join existing_isni_map e
-                on t.matched_isni = e.matched_isni
-            left join allocated_new_ids a
-                on t.matched_isni = a.matched_isni
-        )
-        select *
-        from final_isni_map
-    ) m
-    where tgt.indigo_contr_id is null
-      and tgt.matched_isni = m.matched_isni;
+        select
+            matched_isni,
+            indigo_author_id
+        from ci_dev.data_engineering.matched_author_isbn13
+        qualify row_number() over (partition by matched_isni order by matched_isni) = 1
+    ) cln
+    where stg.indigo_contr_id is null
+      and stg.matched_isni = cln.matched_isni;
 
-/* Null out ISNI, source flag and Indigo ID for unidentified/unknown/anonymous records */
+/* Create new INDIGO_CONTR_ID where ISNIs still have none after backfill.
+   Adapted from Original Logic step 2 (Create new INDIGO_AUTHOR_ID where authors didn't have one before);
+   targets stg_indigo_contributor_book_ref_combined_tmp and uses indigo_contr_id column name. */
+update stg_indigo_contributor_book_ref_combined_tmp stg
+    set indigo_contr_id = new.new_indigo_contr_id
+    from (
+        with max_id as (
+            select max(indigo_author_id) as max_indigo_author_id
+            from (
+                select indigo_author_id from ci_dev.data_engineering.matched_author_isbn13
+                union all
+                select indigo_contr_id   from stg_indigo_contributor_book_ref_combined_tmp
+            )
+        ),
+        new_isni as (
+            select distinct matched_isni
+            from stg_indigo_contributor_book_ref_combined_tmp
+            where indigo_contr_id is null
+              and matched_isni is not null
+        )
+        select
+            nis.matched_isni,
+            mid.max_indigo_author_id
+            + row_number() over (order by nis.matched_isni) as new_indigo_contr_id
+        from new_isni nis
+        cross join max_id mid
+    ) new
+    where stg.matched_isni = new.matched_isni
+      and stg.indigo_contr_id is null;
+
+/* Null out ISNI, ref_to, and Indigo ID for placeholder author names.
+   [NEW] These records carry no real author identity and should not be
+   persisted with ISNI or Indigo ID assignments that would pollute the contributor master. */
 update stg_indigo_contributor_book_ref_combined_tmp
     set
-        matched_isni = null,
-        ref_to = null,
+        matched_isni    = null,
+        ref_to          = null,
         indigo_contr_id = null
     where upper(author_nm) in ('UNIDENTIFIED', 'UNKNOWN', 'ANONYMOUS');
 
-/* Populate INDIGO_CONTR_NM */
+/* Populate INDIGO_CONTR_NM: derive canonical author name per Indigo ID.
+   Adapted from Original Logic step 3 (Populate Consolidated Author Names); same frequency/length/alpha
+   tie-breaker logic, but now operates across the full combined table (base + new) instead of
+   only the new-record staging set, producing a more stable canonical name. */
 create or replace temp table stg_indigo_contributor_book_ref_final_tmp as
     select
         t.trade_db_contributor_id,
@@ -683,9 +680,7 @@ create or replace temp table stg_indigo_contributor_book_ref_final_tmp as
         c.indigo_contr_nm
     from stg_indigo_contributor_book_ref_combined_tmp t
     left join (
-        select
-            indigo_contr_id,
-            author_nm as indigo_contr_nm
+        select indigo_contr_id, author_nm as indigo_contr_nm
         from (
             select
                 indigo_contr_id,
@@ -704,19 +699,13 @@ create or replace temp table stg_indigo_contributor_book_ref_final_tmp as
             group by indigo_contr_id, author_nm
         )
         where rn = 1
-    ) c
-        on t.indigo_contr_id = c.indigo_contr_id;
+    ) c on t.indigo_contr_id = c.indigo_contr_id;
 
-/********************************************************/
-/****************** DATA LOAD ***************************/
-/********************************************************/
-
-/* Keep the delivery snapshot output used by analytics validation */
-create or replace table ci_dev.data_science.indigo_contributor_book_ref_20260226 as
-    select *
-    from stg_indigo_contributor_book_ref_final_tmp;
-
-/* Sync into ETL staging table using Erin-style load structure */
+/* Load fully resolved records into stg_matched_author_isbn13, bridging to DATA LOAD.
+   Replaces Original Logic's steps 4-6 (generate hash, clear trdb%, delete nulls) with a single
+   inline truncate + insert: hash is computed here, trdb% placeholders are excluded via
+   WHERE clause, and null indigo_contr_id rows (UNIDENTIFIED/UNKNOWN/ANONYMOUS) are excluded
+   by the WHERE clause — matching the net effect of those three Original Logic UPDATE/DELETE steps. */
 truncate table ci_dev.data_engineering.stg_matched_author_isbn13;
 
 insert into ci_dev.data_engineering.stg_matched_author_isbn13 (
@@ -737,31 +726,38 @@ select distinct
     isbn13,
     indigo_contr_id as indigo_author_id,
     trade_db_contributor_id,
-    contributor_role as trade_db_contributor_role,
+    contributor_role  as trade_db_contributor_role,
     contributor_order as trade_db_contributor_order,
     matched_isni,
-    indigo_contr_nm as normailized_author_name,
-    author_nm as trade_db_author_name,
-    ref_to as id_source,
+    indigo_contr_nm   as normailized_author_name,
+    author_nm         as trade_db_author_name,
+    ref_to            as id_source,
     hash(trade_db_contributor_id, indigo_contr_id, indigo_contr_nm, matched_isni) as dmc_sync_hash_id,
-    true as dmc_synced,
-    42 as transformation_id
-from stg_indigo_contributor_book_ref_final_tmp;
+    true              as dmc_synced,
+    42                as transformation_id
+from stg_indigo_contributor_book_ref_final_tmp
+where indigo_contr_id       is not null
+  and indigo_contr_nm        is not null
+  and (matched_isni is null or matched_isni not ilike 'trdb%');
+ 
+ 
+/********************************************************/
+/****************** DATA LOAD ***************************/
+/********************************************************/
 
-/* Capture old hashes to identify inserted/changed rows */
+/* Get the existing DMC_SYNC_HASH_IDs from CLEANSED to identify changed records after the merge */
 create or replace temp table ci_dev.data_engineering.stg_matched_author_isbn13_old_hashes_tmp as
-    select dmc_sync_hash_id
-    from ci_dev.data_engineering.matched_author_isbn13;
+    select dmc_sync_hash_id from  ci_dev.data_engineering.matched_author_isbn13
+;
 
-merge into ci_dev.data_engineering.matched_author_isbn13 t
-using ci_dev.data_engineering.stg_matched_author_isbn13 s
-on t.isbn13 = s.isbn13
-   and t.indigo_author_id = s.indigo_author_id
-   and t.trade_db_contributor_id = s.trade_db_contributor_id
-   and t.trade_db_contributor_order = s.trade_db_contributor_order
-   and t.trade_db_contributor_role = s.trade_db_contributor_role
+merge into ci_dev.data_engineering.matched_author_isbn13 t using ci_dev.data_engineering.stg_matched_author_isbn13 s on
+t.isbn13 = s.isbn13 and
+t.indigo_author_id = s.indigo_author_id and
+t.trade_db_contributor_id = s.trade_db_contributor_id and
+t.trade_db_contributor_order = s.trade_db_contributor_order and
+t.trade_db_contributor_role = s.trade_db_contributor_role
 when not matched then insert
-(
+(    
     isbn13,
     indigo_author_id,
     trade_db_contributor_id,
@@ -775,7 +771,7 @@ when not matched then insert
     transformation_id
 )
 values
-(
+(    
     s.isbn13,
     s.indigo_author_id,
     s.trade_db_contributor_id,
@@ -803,11 +799,11 @@ set
     t.etl_updated_date = current_timestamp,
     t.transformation_id = 42;
 
-/* Mark only new/changed rows as not synced */
+/* Set the DMC_SYNCED = FALSE where there are new or changed records */
 update ci_dev.data_engineering.matched_author_isbn13 dst
-set dmc_synced = false
+set dmc_synced = false 
 where not exists (
     select 1
     from ci_dev.data_engineering.stg_matched_author_isbn13_old_hashes_tmp old
     where dst.dmc_sync_hash_id = old.dmc_sync_hash_id
-);
+    );
